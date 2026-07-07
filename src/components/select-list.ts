@@ -3,7 +3,7 @@ import { PROVIDERS, type Model } from '../utils/model.js';
 import type { ApprovalDecision } from '../agent/types.js';
 import { selectListTheme, theme } from '../theme.js';
 
-class VimSelectList extends SelectList {
+export class VimSelectList extends SelectList {
   handleInput(keyData: string): void {
     if (keyData === 'j') {
       super.handleInput('\u001b[B');
@@ -51,6 +51,27 @@ export function createProviderSelector(
   const list = new VimSelectList(items, 8, selectListTheme);
   list.onSelect = (item) => onSelect(item.value);
   list.onCancel = () => onSelect(null);
+  return list;
+}
+
+export function createSearchProviderSelector(
+  currentProvider: string,
+  onSelect: (providerId: 'exa' | 'perplexity' | 'tavily' | 'langsearch') => void,
+  onCancel: () => void,
+) {
+  const providers: { id: 'exa' | 'perplexity' | 'tavily' | 'langsearch'; displayName: string }[] = [
+    { id: 'exa', displayName: 'Exa' },
+    { id: 'perplexity', displayName: 'Perplexity' },
+    { id: 'tavily', displayName: 'Tavily' },
+    { id: 'langsearch', displayName: 'LangSearch' },
+  ];
+  const items: SelectItem[] = providers.map((provider, index) => ({
+    value: provider.id,
+    label: `${index + 1}. ${provider.displayName}${currentProvider === provider.id ? ' ✓' : ''}`,
+  }));
+  const list = new VimSelectList(items, 5, selectListTheme);
+  list.onSelect = (item) => onSelect(item.value as 'exa' | 'perplexity' | 'tavily' | 'langsearch');
+  list.onCancel = () => onCancel();
   return list;
 }
 

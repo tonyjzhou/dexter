@@ -1,4 +1,4 @@
-import { AIMessage } from '@langchain/core/messages';
+import { AIMessage, AIMessageChunk, BaseMessage } from '@langchain/core/messages';
 import { ChatOpenAI } from '@langchain/openai';
 import { ChatAnthropic } from '@langchain/anthropic';
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
@@ -12,10 +12,11 @@ import { z } from 'zod';
 import { DEFAULT_SYSTEM_PROMPT } from '@/agent/prompts';
 import type { TokenUsage } from '@/agent/types';
 import { logger } from '@/utils';
+import { classifyError, isNonRetryableError } from '@/utils/errors';
 import { resolveProvider, getProviderById } from '@/providers';
 
 export const DEFAULT_PROVIDER = 'openai';
-export const DEFAULT_MODEL = 'gpt-5.2';
+export const DEFAULT_MODEL = 'gpt-5.5';
 
 /**
  * Gets the fast model variant for the given provider.
@@ -32,7 +33,12 @@ async function withRetry<T>(fn: () => Promise<T>, provider: string, maxAttempts 
       return await fn();
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
-      logger.error(`[${provider} API] error (attempt ${attempt + 1}/${maxAttempts}): ${message}`);
+      const errorType = classifyError(message);
+      logger.error(`[${provider} API] ${errorType} error (attempt ${attempt + 1}/${maxAttempts}): ${message}`);
+
+      if (isNonRetryableError(message)) {
+        throw new Error(`[${provider} API] ${message}`);
+      }
 
       if (attempt === maxAttempts - 1) {
         throw new Error(`[${provider} API] ${message}`);
@@ -99,21 +105,42 @@ const MODEL_FACTORIES: Record<string, ModelFactory> = {
         baseURL: 'https://api.moonshot.cn/v1',
       },
     }),
-  deepseek: (name, opts) =>
-    new ChatOpenAI({
+  deepseek: (name, opts) => {
+    // Both deepseek-v4-pro and deepseek-v4-flash support thinking mode.
+    // temperature/top_p/presence_penalty/frequency_penalty are ignored in thinking mode.
+    const isThinkingModel = name === 'deepseek-v4-pro' || name === 'deepseek-v4-flash';
+    return new ChatOpenAI({
       model: name,
       ...opts,
       apiKey: getApiKey('DEEPSEEK_API_KEY'),
       configuration: {
         baseURL: 'https://api.deepseek.com',
       },
-    }),
+      ...(isThinkingModel && {
+        // reasoning_effort is a top-level param; thinking toggle goes in extra_body
+        // per DeepSeek V4 API docs (OpenAI SDK compat layer)
+        reasoning_effort: 'high',
+        extraBody: {
+          thinking: { type: 'enabled' },
+        },
+      }),
+    });
+  },
   ollama: (name, opts) =>
     new ChatOllama({
       model: name.replace(/^ollama:/, ''),
       ...opts,
       ...(process.env.OLLAMA_BASE_URL ? { baseUrl: process.env.OLLAMA_BASE_URL } : {}),
     }),
+  'ollama-cloud': (name, opts) => {
+    const apiKey = process.env.OLLAMA_CLOUD_API_KEY;
+    return new ChatOllama({
+      model: name.replace(/^ollama-cloud:/, ''),
+      ...opts,
+      baseUrl: 'https://ollama.com',
+      headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+    });
+  },
 };
 
 const DEFAULT_FACTORY: ModelFactory = (name, opts) =>
@@ -234,4 +261,124 @@ export async function callLlm(prompt: string, options: CallLlmOptions = {}): Pro
     return { response: (result as { content: string }).content, usage };
   }
   return { response: result as AIMessage, usage };
+}
+
+// ---------------------------------------------------------------------------
+// Multi-turn message array API
+// ---------------------------------------------------------------------------
+
+/**
+ * Annotate the first SystemMessage with Anthropic's cache_control for prompt
+ * caching (~90% input token savings on repeated calls).
+ */
+function annotateSystemMessageForCaching(messages: BaseMessage[]): BaseMessage[] {
+  if (messages.length === 0 || messages[0]._getType() !== 'system') {
+    return messages;
+  }
+
+  const systemMsg = messages[0];
+  const text = typeof systemMsg.content === 'string'
+    ? systemMsg.content
+    : JSON.stringify(systemMsg.content);
+
+  const annotated = new SystemMessage({
+    content: [
+      {
+        type: 'text' as const,
+        text,
+        cache_control: { type: 'ephemeral' },
+      },
+    ],
+  });
+
+  return [annotated, ...messages.slice(1)];
+}
+
+interface CallLlmWithMessagesOptions {
+  model?: string;
+  tools?: StructuredToolInterface[];
+  signal?: AbortSignal;
+}
+
+/**
+ * Call an LLM with a full message array (multi-turn tool-calling).
+ *
+ * Unlike callLlm() which takes a single prompt string, this function accepts
+ * a BaseMessage[] array containing SystemMessage, HumanMessage, AIMessage,
+ * and ToolMessage objects. This enables the agent loop where
+ * conversation history (including model reasoning and tool results) persists
+ * across iterations.
+ *
+ * All LangChain providers support BaseMessage[] via BaseChatModel.invoke().
+ */
+export async function callLlmWithMessages(
+  messages: BaseMessage[],
+  options: CallLlmWithMessagesOptions = {},
+): Promise<LlmResult> {
+  const { model = DEFAULT_MODEL, tools, signal } = options;
+
+  const llm = getChatModel(model, false);
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let runnable: Runnable<any, any> = llm;
+
+  if (tools && tools.length > 0 && llm.bindTools) {
+    runnable = llm.bindTools(tools);
+  }
+
+  const invokeOpts = signal ? { signal } : undefined;
+  const provider = resolveProvider(model);
+
+  // For Anthropic: annotate SystemMessage with cache_control for prompt caching
+  const finalMessages = provider.id === 'anthropic'
+    ? annotateSystemMessageForCaching(messages)
+    : messages;
+
+  const result = await withRetry(
+    () => runnable.invoke(finalMessages, invokeOpts),
+    provider.displayName,
+  );
+
+  const usage = extractUsage(result);
+  return { response: result as AIMessage, usage };
+}
+
+// ---------------------------------------------------------------------------
+// Streaming multi-turn API
+// ---------------------------------------------------------------------------
+
+/**
+ * Stream an LLM response as AIMessageChunk objects.
+ *
+ * Uses LangChain's .stream() method. Chunks can be accumulated via .concat()
+ * to progressively build complete tool_calls. Falls back to blocking invoke
+ * if streaming is not supported by the provider.
+ */
+export async function* streamLlmWithMessages(
+  messages: BaseMessage[],
+  options: CallLlmWithMessagesOptions = {},
+): AsyncGenerator<AIMessageChunk, void> {
+  const { model = DEFAULT_MODEL, tools, signal } = options;
+
+  const llm = getChatModel(model, true);
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let runnable: Runnable<any, any> = llm;
+
+  if (tools && tools.length > 0 && llm.bindTools) {
+    runnable = llm.bindTools(tools);
+  }
+
+  const invokeOpts = signal ? { signal } : undefined;
+  const provider = resolveProvider(model);
+
+  const finalMessages = provider.id === 'anthropic'
+    ? annotateSystemMessageForCaching(messages)
+    : messages;
+
+  const stream = await runnable.stream(finalMessages, invokeOpts);
+
+  for await (const chunk of stream) {
+    yield chunk as AIMessageChunk;
+  }
 }

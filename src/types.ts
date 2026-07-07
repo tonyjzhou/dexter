@@ -5,7 +5,7 @@ export type WorkingState =
   | { status: 'thinking' }
   | { status: 'tool'; toolName: string }
   | { status: 'approval'; toolName: string }
-  | { status: 'answering'; startTime: number };
+  | { status: 'question' };
 
 export type HistoryItemStatus = 'processing' | 'complete' | 'error' | 'interrupted';
 

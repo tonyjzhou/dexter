@@ -6,6 +6,38 @@ import { callLlm } from '../../model/llm.js';
 import { formatToolResult } from '../types.js';
 import { getCurrentDate } from '../../agent/prompts.js';
 import { getFilings, get10KFilingItems, get10QFilingItems, get8KFilingItems, getFilingItemTypes, type FilingItemTypes } from './filings.js';
+import { withTimeout, SUB_TOOL_TIMEOUT_MS } from './utils.js';
+
+/**
+ * Rich description for the read_filings tool.
+ * Used in the system prompt to guide the LLM on when and how to use this tool.
+ */
+export const READ_FILINGS_DESCRIPTION = `
+Intelligent meta-tool for reading SEC filing content. Takes a natural language query and handles the complete workflow of fetching filing metadata and reading the actual text content.
+
+## When to Use
+
+- Reading 10-K annual reports (business description, risk factors, MD&A, financial statements)
+- Reading 10-Q quarterly reports (quarterly financials, MD&A, market risk disclosures)
+- Reading 8-K current reports (material events, acquisitions, earnings announcements)
+- Analyzing or comparing content across multiple SEC filings
+- Extracting specific sections from filings (e.g., "AAPL risk factors", "TSLA business description")
+
+## When NOT to Use
+
+- Stock prices (use get_market_data)
+- Financial statements data in structured format (use get_financials)
+- Company news (use get_financials)
+- Non-SEC data (use web_search)
+
+## Usage Notes
+
+- Call ONCE with the complete natural language query
+- Handles ticker resolution (Apple -> AAPL)
+- Handles filing type inference (risk factors -> 10-K, quarterly results -> 10-Q)
+- API calls can be slow - tool limits to 3 filings max per query
+- Intelligently retrieves specific sections when query targets particular content, full filing otherwise
+`.trim();
 
 // Escape curly braces for LangChain template interpolation
 function escapeTemplateVars(str: string): string {
@@ -238,7 +270,7 @@ export function createReadFilings(model: string): DynamicStructuredTool {
             if (!tool) {
               throw new Error(`Tool '${tc.name}' not found`);
             }
-            const rawResult = await tool.invoke(tc.args);
+            const rawResult = await withTimeout(tool.invoke(tc.args), SUB_TOOL_TIMEOUT_MS, tc.name);
             const result = typeof rawResult === 'string' ? rawResult : JSON.stringify(rawResult);
             const parsed = JSON.parse(result);
             return {

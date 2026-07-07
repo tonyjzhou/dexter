@@ -1,8 +1,10 @@
 import { Container, Spacer, Text, type TUI } from '@mariozechner/pi-tui';
 import type { TokenUsage } from '../agent/types.js';
+import type { QuestionAnswer } from '../tools/ask-user-question/types.js';
 import { theme } from '../theme.js';
 import { AnswerBoxComponent } from './answer-box.js';
 import { ToolEventComponent } from './tool-event.js';
+import { SubagentGroupComponent } from './subagent-group.js';
 import { UserQueryComponent } from './user-query.js';
 
 function formatDuration(ms: number): string {
@@ -56,6 +58,7 @@ interface ToolDisplayComponent {
   setLimitWarning(warning?: string): void;
   setApproval(decision: 'allow-once' | 'allow-session' | 'deny'): void;
   setDenied(path: string, tool: string): void;
+  dispose?(): void;
 }
 
 class BrowserSessionComponent extends Container implements ToolDisplayComponent {
@@ -135,7 +138,10 @@ export class ChatLogComponent extends Container {
   private readonly tui: TUI;
   private readonly toolById = new Map<string, ToolDisplayComponent>();
   private currentBrowserSession: BrowserSessionComponent | null = null;
+  private currentSubagentGroup: SubagentGroupComponent | null = null;
   private activeAnswer: AnswerBoxComponent | null = null;
+  private lastToolName: string | null = null;
+  private lastToolComponent: ToolDisplayComponent | null = null;
 
   constructor(tui: TUI) {
     super();
@@ -143,14 +149,27 @@ export class ChatLogComponent extends Container {
   }
 
   clearAll() {
+    // Stop any running spinners before clearing
+    for (const component of this.toolById.values()) {
+      component.dispose?.();
+    }
+    this.currentSubagentGroup?.dispose();
     this.clear();
     this.toolById.clear();
     this.currentBrowserSession = null;
+    this.currentSubagentGroup = null;
     this.activeAnswer = null;
+    this.lastToolName = null;
+    this.lastToolComponent = null;
   }
 
   addQuery(query: string) {
     this.addChild(new UserQueryComponent(query));
+  }
+
+  resetToolGrouping() {
+    this.lastToolName = null;
+    this.lastToolComponent = null;
   }
 
   addInterrupted() {
@@ -161,11 +180,27 @@ export class ChatLogComponent extends Container {
     if (toolName !== 'browser') {
       this.currentBrowserSession = null;
     }
+    if (toolName !== 'spawn_subagent') {
+      this.currentSubagentGroup = null;
+    }
 
     const existing = this.toolById.get(toolCallId);
     if (existing) {
       existing.setActive();
       return existing;
+    }
+
+    if (toolName === 'spawn_subagent') {
+      if (!this.currentSubagentGroup) {
+        this.currentSubagentGroup = new SubagentGroupComponent(this.tui);
+        this.addChild(this.currentSubagentGroup);
+      }
+      const handle = this.currentSubagentGroup.addCall(args);
+      this.toolById.set(toolCallId, handle);
+      // Prevent the generic same-name reuse path from merging the next tool.
+      this.lastToolName = null;
+      this.lastToolComponent = null;
+      return handle;
     }
 
     if (toolName === 'browser') {
@@ -176,14 +211,28 @@ export class ChatLogComponent extends Container {
       this.currentBrowserSession.setStep(args);
       this.currentBrowserSession.setActive();
       this.toolById.set(toolCallId, this.currentBrowserSession);
+      this.lastToolName = null;
+      this.lastToolComponent = null;
       return this.currentBrowserSession;
+    }
+
+    if (this.lastToolName === toolName && this.lastToolComponent) {
+      this.lastToolComponent.setActive();
+      this.toolById.set(toolCallId, this.lastToolComponent);
+      return this.lastToolComponent;
     }
 
     const component = new ToolEventComponent(this.tui, toolName, args);
     component.setActive();
     this.toolById.set(toolCallId, component);
     this.addChild(component);
+    this.lastToolName = toolName;
+    this.lastToolComponent = component;
     return component;
+  }
+
+  getToolById(toolCallId: string): ToolDisplayComponent | undefined {
+    return this.toolById.get(toolCallId);
   }
 
   updateToolProgress(toolCallId: string, message: string) {
@@ -234,29 +283,28 @@ export class ChatLogComponent extends Container {
     existing.setDenied(path, tool);
   }
 
-  startAnswer() {
-    if (this.activeAnswer) {
-      return this.activeAnswer;
-    }
-    this.activeAnswer = new AnswerBoxComponent('');
-    this.activeAnswer.setStreaming(true);
-    this.addChild(this.activeAnswer);
-    return this.activeAnswer;
-  }
-
-  updateAnswer(text: string) {
-    const answer = this.startAnswer();
-    answer.setText(text);
-  }
-
   finalizeAnswer(text: string) {
     if (!this.activeAnswer) {
       this.addChild(new AnswerBoxComponent(text));
       return;
     }
-    this.activeAnswer.setStreaming(false);
     this.activeAnswer.setText(text);
     this.activeAnswer = null;
+  }
+
+  addAnsweredQuestions(answers: QuestionAnswer[]) {
+    if (answers.length === 0) {
+      return;
+    }
+    this.addChild(new Text(`${theme.success('⏺')} ${theme.muted('Answered:')}`, 0, 0));
+    for (const a of answers) {
+      const picks = [...a.selected];
+      if (a.otherText) {
+        picks.push(a.otherText);
+      }
+      const ans = picks.length ? picks.join(', ') : '—';
+      this.addChild(new Text(`${theme.muted('⎿  ')}${theme.dim(`${a.question} → ${ans}`)}`, 0, 0));
+    }
   }
 
   addContextCleared(clearedCount: number, keptCount: number) {
@@ -271,15 +319,61 @@ export class ChatLogComponent extends Container {
     );
   }
 
-  addPerformanceStats(duration: number, tokenUsage?: TokenUsage, tokensPerSecond?: number) {
-    if (!tokenUsage || duration < 10_000) {
-      return;
-    }
-    const parts = [formatDuration(duration), `${tokenUsage.totalTokens.toLocaleString()} tokens`];
-    if (tokensPerSecond !== undefined) {
-      parts.push(`(${tokensPerSecond.toFixed(1)} tok/s)`);
-    }
+  addQueuedMessage(text: string) {
     this.addChild(new Spacer(1));
-    this.addChild(new Text(`${theme.muted('✻ ')}${theme.muted(parts.join(' · '))}`, 0, 0));
+    this.addChild(
+      new Text(
+        `${theme.muted(`❯ ${text}`)}`,
+        0,
+        0,
+      ),
+    );
+  }
+
+  addQueueDrain(count: number) {
+    this.addChild(
+      new Text(
+        `${theme.muted(`⏺ Picked up ${count} queued message${count !== 1 ? 's' : ''}`)}`,
+        0,
+        0,
+      ),
+    );
+  }
+
+  addMicrocompact(cleared: number, tokensSaved: number) {
+    this.addChild(
+      new Text(
+        `${theme.muted(`⏺ Microcompact: cleared ${cleared} old tool result${cleared !== 1 ? 's' : ''} (~${Math.round(tokensSaved / 1000)}K tokens)`)}`,
+        0,
+        0,
+      ),
+    );
+  }
+
+  addCompaction(success: boolean, preTokens?: number, postTokens?: number) {
+    if (success && preTokens && postTokens) {
+      const saved = preTokens - postTokens;
+      const pct = Math.round((saved / preTokens) * 100);
+      this.addChild(
+        new Text(
+          `${theme.muted(`⏺ Context compacted (${pct}% reduction, ~${Math.round(saved / 1000)}K tokens saved)`)}`,
+          0,
+          0,
+        ),
+      );
+    } else if (!success) {
+      this.addChild(
+        new Text(
+          `${theme.muted('⏺ Compaction failed, falling back to context clearing')}`,
+          0,
+          0,
+        ),
+      );
+    }
+  }
+
+  addPerformanceStats(duration: number, _tokenUsage?: TokenUsage, _tokensPerSecond?: number) {
+    this.addChild(new Spacer(1));
+    this.addChild(new Text(`${theme.muted('✻ ')}${theme.muted(formatDuration(duration))}`, 0, 0));
   }
 }

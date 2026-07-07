@@ -11,6 +11,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from '
 import { join, dirname } from 'path';
 import { createHash } from 'crypto';
 import { logger } from './logger.js';
+import { dexterPath } from './paths.js';
 
 // ============================================================================
 // Types
@@ -28,7 +29,7 @@ interface CacheEntry {
   cachedAt: string;
 }
 
-const CACHE_DIR = '.dexter/cache';
+const CACHE_DIR = dexterPath('cache');
 
 // ============================================================================
 // Helpers
@@ -127,7 +128,8 @@ function removeCacheFile(filepath: string): void {
  */
 export function readCache(
   endpoint: string,
-  params: Record<string, string | number | string[] | undefined>
+  params: Record<string, string | number | string[] | undefined>,
+  ttlMs?: number,
 ): { data: Record<string, unknown>; url: string } | null {
   const cacheKey = buildCacheKey(endpoint, params);
   const filepath = join(CACHE_DIR, cacheKey);
@@ -141,18 +143,24 @@ export function readCache(
     const content = readFileSync(filepath, 'utf-8');
     const parsed: unknown = JSON.parse(content);
 
-    // Validate entry structure
     if (!isValidCacheEntry(parsed)) {
       logger.warn(`Cache corrupted (invalid structure): ${label}`, { filepath });
       removeCacheFile(filepath);
       return null;
     }
 
+    // TTL enforcement: return null if entry has expired
+    if (ttlMs !== undefined) {
+      const age = Date.now() - Date.parse(parsed.cachedAt);
+      if (age > ttlMs) {
+        return null;
+      }
+    }
+
     return { data: parsed.data, url: parsed.url };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     logger.warn(`Cache read error: ${label} — ${message}`, { filepath });
-    // Remove corrupted file so subsequent calls don't hit the same error
     removeCacheFile(filepath);
     return null;
   }

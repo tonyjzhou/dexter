@@ -22,7 +22,7 @@ DCF Analysis Progress:
 
 ## Step 1: Gather Financial Data
 
-Call the `financial_search` tool with these queries:
+Call the `get_financials` tool with these queries:
 
 ### 1.1 Cash Flow History
 **Query:** `"[TICKER] annual cash flow statements for the last 5 years"`
@@ -43,19 +43,16 @@ Call the `financial_search` tool with these queries:
 
 **Fallback:** If `current_investments` missing, use 0
 
-### 1.4 Analyst Estimates
-**Query:** `"[TICKER] analyst estimates"`
+### 1.4 Current Price
+Call the `get_market_data` tool:
 
-**Extract:** `earnings_per_share` (forward estimates by fiscal year)
-
-**Use:** Calculate implied EPS growth rate for cross-validation
-
-### 1.5 Current Price
 **Query:** `"[TICKER] price snapshot"`
 
 **Extract:** `price`
 
-### 1.6 Company Facts
+### 1.5 Company Facts
+Call the `get_financials` tool:
+
 **Query:** `"[TICKER] company facts"`
 
 **Extract:** `sector`, `industry`, `market_cap`
@@ -66,11 +63,10 @@ Call the `financial_search` tool with these queries:
 
 Calculate 5-year FCF CAGR from cash flow history.
 
-**Cross-validate with:** `free_cash_flow_growth` (YoY), `revenue_growth`, analyst EPS growth
+**Cross-validate with:** `free_cash_flow_growth` (YoY), `revenue_growth`
 
 **Growth rate selection:**
 - Stable FCF history → Use CAGR with 10-20% haircut
-- Volatile FCF → Weight analyst estimates more heavily
 - **Cap at 15%** (sustained higher growth is rare)
 
 ## Step 3: Estimate Discount Rate (WACC)

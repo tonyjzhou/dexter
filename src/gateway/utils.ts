@@ -1,10 +1,11 @@
 export function normalizeE164(number: string): string {
   const withoutPrefix = number.replace(/^whatsapp:/, '').trim();
-  const digits = withoutPrefix.replace(/[^\d+]/g, '');
-  if (digits.startsWith('+')) {
-    return `+${digits.slice(1)}`;
+  // Strip everything except digits; we deliberately ignore any number of leading '+'.
+  const digitsOnly = withoutPrefix.replace(/[^\d]/g, '');
+  if (!digitsOnly) {
+    return '+';
   }
-  return `+${digits}`;
+  return `+${digitsOnly}`;
 }
 
 export function isSelfChatMode(
@@ -38,6 +39,20 @@ export function isSelfChatMode(
  * - For group JIDs (@g.us), returns as-is
  * - Otherwise, normalizes as E.164 and converts to @s.whatsapp.net format
  */
+/**
+ * Clean up markdown for WhatsApp compatibility.
+ * - Converts `**text**` (markdown bold) to `*text*` (WhatsApp bold)
+ * - Merges adjacent bold sections to prevent literal asterisks showing
+ */
+export function cleanMarkdownForWhatsApp(text: string): string {
+  let result = text;
+  // Convert markdown bold (**text**) to WhatsApp bold (*text*)
+  result = result.replace(/\*\*([^*]+)\*\*/g, '*$1*');
+  // Merge adjacent bold sections: `*foo* *bar*` -> `*foo bar*`
+  result = result.replace(/\*([^*]+)\*\s+\*([^*]+)\*/g, '*$1 $2*');
+  return result;
+}
+
 export function toWhatsappJid(input: string): string {
   const clean = input.replace(/^whatsapp:/, '').trim();
   

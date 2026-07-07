@@ -16,4 +16,11 @@ export { cursorHandlers } from './input-key-handlers.js';
 export type { CursorContext } from './input-key-handlers.js';
 export { getToolDescription } from './tool-description.js';
 export { transformMarkdownTables, formatResponse } from './markdown-table.js';
-export { estimateTokens, TOKEN_BUDGET } from './tokens.js';
+export { estimateTokens } from './tokens.js';
+export {
+  parseApiErrorInfo,
+  classifyError,
+  isContextOverflowError,
+  isNonRetryableError,
+  formatUserFacingError,
+} from './errors.js';

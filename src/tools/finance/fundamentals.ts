@@ -1,7 +1,10 @@
 import { DynamicStructuredTool } from '@langchain/core/tools';
 import { z } from 'zod';
-import { callApi } from './api.js';
+import { api, stripFieldsDeep } from './api.js';
 import { formatToolResult } from '../types.js';
+import { TTL_24H } from './utils.js';
+
+const REDUNDANT_FINANCIAL_FIELDS = ['accession_number', 'currency', 'period'] as const;
 
 const FinancialStatementsInputSchema = z.object({
   ticker: z
@@ -16,9 +19,9 @@ const FinancialStatementsInputSchema = z.object({
     ),
   limit: z
     .number()
-    .default(10)
+    .default(4)
     .describe(
-      'Maximum number of report periods to return (default: 10). Returns the most recent N periods based on the period type.'
+      'Maximum number of report periods to return (default: 4). Returns the most recent N periods based on the period type. Increase this for longer historical analysis when needed.'
     ),
   report_period_gt: z
     .string()
@@ -60,8 +63,11 @@ export const getIncomeStatements = new DynamicStructuredTool({
   schema: FinancialStatementsInputSchema,
   func: async (input) => {
     const params = createParams(input);
-    const { data, url } = await callApi('/financials/income-statements/', params);
-    return formatToolResult(data.income_statements || {}, [url]);
+    const { data, url } = await api.get('/financials/income-statements/', params, { cacheable: true, ttlMs: TTL_24H });
+    return formatToolResult(
+      stripFieldsDeep(data.income_statements || {}, REDUNDANT_FINANCIAL_FIELDS),
+      [url]
+    );
   },
 });
 
@@ -71,8 +77,11 @@ export const getBalanceSheets = new DynamicStructuredTool({
   schema: FinancialStatementsInputSchema,
   func: async (input) => {
     const params = createParams(input);
-    const { data, url } = await callApi('/financials/balance-sheets/', params);
-    return formatToolResult(data.balance_sheets || {}, [url]);
+    const { data, url } = await api.get('/financials/balance-sheets/', params, { cacheable: true, ttlMs: TTL_24H });
+    return formatToolResult(
+      stripFieldsDeep(data.balance_sheets || {}, REDUNDANT_FINANCIAL_FIELDS),
+      [url]
+    );
   },
 });
 
@@ -82,8 +91,11 @@ export const getCashFlowStatements = new DynamicStructuredTool({
   schema: FinancialStatementsInputSchema,
   func: async (input) => {
     const params = createParams(input);
-    const { data, url } = await callApi('/financials/cash-flow-statements/', params);
-    return formatToolResult(data.cash_flow_statements || {}, [url]);
+    const { data, url } = await api.get('/financials/cash-flow-statements/', params, { cacheable: true, ttlMs: TTL_24H });
+    return formatToolResult(
+      stripFieldsDeep(data.cash_flow_statements || {}, REDUNDANT_FINANCIAL_FIELDS),
+      [url]
+    );
   },
 });
 
@@ -93,8 +105,11 @@ export const getAllFinancialStatements = new DynamicStructuredTool({
   schema: FinancialStatementsInputSchema,
   func: async (input) => {
     const params = createParams(input);
-    const { data, url } = await callApi('/financials/', params);
-    return formatToolResult(data.financials || {}, [url]);
+    const { data, url } = await api.get('/financials/', params, { cacheable: true, ttlMs: TTL_24H });
+    return formatToolResult(
+      stripFieldsDeep(data.financials || {}, REDUNDANT_FINANCIAL_FIELDS),
+      [url]
+    );
   },
 });
 

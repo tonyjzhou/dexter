@@ -1,5 +1,6 @@
 export { AnswerBoxComponent } from './answer-box.js';
 export { ApprovalPromptComponent } from './approval-prompt.js';
+export { QuestionPromptComponent } from './question-prompt.js';
 export { ChatLogComponent } from './chat-log.js';
 export { DebugPanelComponent } from './debug-panel.js';
 export { CustomEditor } from './custom-editor.js';
@@ -10,7 +11,9 @@ export {
   createApprovalSelector,
   createModelSelector,
   createProviderSelector,
+  createSearchProviderSelector,
 } from './select-list.js';
 export { ToolEventComponent } from './tool-event.js';
 export { UserQueryComponent } from './user-query.js';
+export { HintBarComponent } from './hint-bar.js';
 export { WorkingIndicatorComponent } from './working-indicator.js';

@@ -1,34 +1,52 @@
+import { readFile } from 'node:fs/promises';
 import { Container, ProcessTerminal, Spacer, Text, TUI } from '@mariozechner/pi-tui';
 import type {
-  AgentEvent,
   ApprovalDecision,
-  DoneEvent,
   ToolEndEvent,
   ToolErrorEvent,
   ToolStartEvent,
 } from './agent/index.js';
-import { getModelDisplayName } from './utils/model.js';
-import { getApiKeyNameForProvider, getProviderDisplayName } from './utils/env.js';
-import type { DisplayEvent } from './agent/types.js';
+import {
+  getApiKeyNameForProvider,
+  getApiKeyNameForSearchProvider,
+  getProviderDisplayName,
+  getSearchProviderDisplayName,
+} from './utils/env.js';
+import { dexterPath } from './utils/paths.js';
+import { defaultQueue } from './utils/message-queue.js';
 import { logger } from './utils/logger.js';
 import {
   AgentRunnerController,
   InputHistoryController,
   ModelSelectionController,
+  SearchSelectionController,
 } from './controllers/index.js';
 import {
   ApiKeyInputComponent,
   ApprovalPromptComponent,
+  QuestionPromptComponent,
   ChatLogComponent,
   CustomEditor,
   DebugPanelComponent,
+  HintBarComponent,
   IntroComponent,
   WorkingIndicatorComponent,
   createApiKeyConfirmSelector,
   createModelSelector,
   createProviderSelector,
+  createSearchProviderSelector,
 } from './components/index.js';
 import { editorTheme, theme } from './theme.js';
+import { matchCommands, type SlashCommand } from './commands/index.js';
+import { initSpinner } from './utils/spinner.js';
+
+function truncateForHistory(text: string): string {
+  const lines = text.split('\n');
+  if (lines.length <= 3) return text;
+  const firstLine = lines[0].trim() || lines[1]?.trim() || 'pasted content';
+  const preview = firstLine.length > 60 ? firstLine.slice(0, 60) + '...' : firstLine;
+  return `${preview} [+${lines.length - 1} lines]`;
+}
 
 function truncateAtWord(str: string, maxLength: number): string {
   if (str.length <= maxLength) {
@@ -54,7 +72,8 @@ function summarizeToolResult(tool: string, args: Record<string, unknown>, result
       }
       if (typeof parsed.data === 'object') {
         const keys = Object.keys(parsed.data).filter((key) => !key.startsWith('_'));
-        if (tool === 'financial_search') {
+        if (tool === 'get_financials' || tool === 'get_market_data' || tool === 'stock_screener') {
+          if (keys.length === 0) return 'Done';
           return keys.length === 1 ? 'Called 1 data source' : `Called ${keys.length} data sources`;
         }
         if (tool === 'web_search') {
@@ -91,75 +110,75 @@ function createScreen(
   return container;
 }
 
-function renderHistory(chatLog: ChatLogComponent, history: AgentRunnerController['history']) {
-  chatLog.clearAll();
-  for (const item of history) {
-    chatLog.addQuery(item.query);
+/**
+ * Render a single display event into the chat log (used by incremental history).
+ */
+function renderEvent(
+  chatLog: ChatLogComponent,
+  display: { event: any; id: string; completed?: boolean; endEvent?: any; progressMessage?: string },
+  itemStatus: string,
+) {
+  const event = display.event;
 
-    if (item.status === 'interrupted') {
-      chatLog.addInterrupted();
+  if (event.type === 'thinking') {
+    const message = event.message.trim();
+    if (message) {
+      chatLog.addChild(
+        new Text(message.length > 200 ? `${message.slice(0, 200)}...` : message, 0, 0),
+      );
     }
+    return;
+  }
 
-    for (const display of item.events) {
-      const event = display.event;
-      if (event.type === 'thinking') {
-        const message = event.message.trim();
-        if (message) {
-          chatLog.addChild(
-            new Text(message.length > 200 ? `${message.slice(0, 200)}...` : message, 0, 0),
-          );
-        }
-        continue;
-      }
-
-      if (event.type === 'tool_start') {
-        const toolStart = event as ToolStartEvent;
-        const component = chatLog.startTool(display.id, toolStart.tool, toolStart.args);
-        if (display.completed && display.endEvent?.type === 'tool_end') {
-          const done = display.endEvent as ToolEndEvent;
-          component.setComplete(
-            summarizeToolResult(done.tool, toolStart.args, done.result),
-            done.duration,
-          );
-        } else if (display.completed && display.endEvent?.type === 'tool_error') {
-          const toolError = display.endEvent as ToolErrorEvent;
-          component.setError(toolError.error);
-        } else if (display.progressMessage) {
-          component.setActive(display.progressMessage);
-        }
-        continue;
-      }
-
-      if (event.type === 'tool_approval') {
-        const approval = chatLog.startTool(display.id, event.tool, event.args);
-        approval.setApproval(event.approved);
-        continue;
-      }
-
-      if (event.type === 'tool_denied') {
-        const denied = chatLog.startTool(display.id, event.tool, event.args);
-        const path = (event.args.path as string) ?? '';
-        denied.setDenied(path, event.tool);
-        continue;
-      }
-
-      if (event.type === 'tool_limit') {
-        const limit = chatLog.startTool(display.id, event.tool, {});
-        limit.setLimitWarning(event.warning);
-        continue;
-      }
-
-      if (event.type === 'context_cleared') {
-        chatLog.addContextCleared(event.clearedCount, event.keptCount);
-      }
+  if (event.type === 'tool_start') {
+    const toolStart = event as ToolStartEvent;
+    // ask_user_question has no tool row: the inline widget is its UI, and an
+    // answered block is appended on submit. (matches the no-tool-message design)
+    if (toolStart.tool === 'ask_user_question') {
+      return;
     }
+    const component = chatLog.startTool(display.id, toolStart.tool, toolStart.args);
+    if (display.completed && display.endEvent?.type === 'tool_end') {
+      const done = display.endEvent as ToolEndEvent;
+      component.setComplete(
+        summarizeToolResult(done.tool, toolStart.args, done.result),
+        done.duration,
+      );
+    } else if (display.completed && display.endEvent?.type === 'tool_error') {
+      const toolError = display.endEvent as ToolErrorEvent;
+      component.setError(toolError.error);
+    } else if (itemStatus === 'interrupted') {
+      // Don't start spinner for tools in interrupted items
+    } else if (display.progressMessage) {
+      component.setActive(display.progressMessage);
+    }
+    return;
+  }
 
-    if (item.answer) {
-      chatLog.finalizeAnswer(item.answer);
-    }
-    if (item.status === 'complete') {
-      chatLog.addPerformanceStats(item.duration ?? 0, item.tokenUsage, item.tokensPerSecond);
-    }
+  if (event.type === 'tool_approval') {
+    chatLog.startTool(display.id, event.tool, event.args).setApproval(event.approved);
+    return;
+  }
+
+  if (event.type === 'tool_denied') {
+    const path = (event.args.path as string) ?? '';
+    chatLog.startTool(display.id, event.tool, event.args).setDenied(path, event.tool);
+    return;
+  }
+
+  if (event.type === 'tool_limit') return;
+
+  if (event.type === 'context_cleared') {
+    chatLog.addContextCleared(event.clearedCount, event.keptCount);
+  }
+  if (event.type === 'microcompact') {
+    chatLog.addMicrocompact(event.cleared, event.tokensSaved);
+  }
+  if (event.type === 'queue_drain') {
+    chatLog.addQueueDrain(event.messageCount);
+  }
+  if (event.type === 'compaction' && event.phase === 'end') {
+    chatLog.addCompaction(event.success ?? false, event.preCompactTokens, event.postCompactTokens);
   }
 }
 
@@ -176,35 +195,231 @@ export async function runCli() {
     tui.requestRender();
   };
 
+  let agentRunner: AgentRunnerController;
   const modelSelection = new ModelSelectionController(onError, () => {
     intro.setModel(modelSelection.model);
+    agentRunner?.updateAgentConfig({
+      model: modelSelection.model,
+      modelProvider: modelSelection.provider,
+    });
+    renderSelectionOverlay();
+    tui.requestRender();
+  });
+  const searchSelection = new SearchSelectionController(onError, () => {
     renderSelectionOverlay();
     tui.requestRender();
   });
 
-  const agentRunner = new AgentRunnerController(
+  // Incremental history tracking
+  let lastRenderedEventCount = 0;
+  let lastRenderedStatus = '';
+  let lastRenderedAnswer = false;
+  let lastRenderedQueryId: string | null = null;
+  const finalizedToolIds = new Set<string>();
+  const appliedToolProgress = new Map<string, string>();
+  let lastPendingApproval: { tool: string; args: Record<string, unknown> } | null = null;
+  let lastPendingQuestion: { questions: unknown[] } | null = null;
+  // Cached so the stateful question overlay survives onChange-driven re-renders
+  // (partial selections, active tab, in-progress text are kept across renders).
+  let activeQuestionPrompt: QuestionPromptComponent | null = null;
+
+  agentRunner = new AgentRunnerController(
     { model: modelSelection.model, modelProvider: modelSelection.provider, maxIterations: 10 },
     modelSelection.inMemoryChatHistory,
     () => {
-      renderHistory(chatLog, agentRunner.history);
+      // Incremental history update — only render new events
+      const history = agentRunner.history;
+      const lastItem = history[history.length - 1];
+      if (lastItem) {
+        // New query started — keyed by id so onChange storms don't re-render the header
+        if (lastItem.id !== lastRenderedQueryId) {
+          chatLog.addQuery(lastItem.query);
+          chatLog.resetToolGrouping();
+          lastRenderedQueryId = lastItem.id;
+        }
+
+        // Render new events only
+        for (let i = lastRenderedEventCount; i < lastItem.events.length; i++) {
+          renderEvent(chatLog, lastItem.events[i], lastItem.status);
+        }
+        lastRenderedEventCount = lastItem.events.length;
+
+        // Update already-rendered tool events that may have completed
+        for (const display of lastItem.events) {
+          if (display.event.type === 'tool_start' && display.completed && display.endEvent && !finalizedToolIds.has(display.id)) {
+            const component = chatLog.getToolById(display.id);
+            if (component) {
+              finalizedToolIds.add(display.id);
+              if (display.endEvent.type === 'tool_end') {
+                component.setComplete(
+                  summarizeToolResult(display.endEvent.tool, display.event.args, display.endEvent.result),
+                  display.endEvent.duration,
+                );
+              } else if (display.endEvent.type === 'tool_error') {
+                component.setError(display.endEvent.error);
+              }
+            }
+          }
+        }
+
+        // Apply live progress to already-rendered, still-running tools. Guarded
+        // by change-detection so each unique message triggers exactly one update.
+        for (const display of lastItem.events) {
+          if (
+            display.event.type === 'tool_start' &&
+            !display.completed &&
+            display.progressMessage &&
+            appliedToolProgress.get(display.id) !== display.progressMessage
+          ) {
+            appliedToolProgress.set(display.id, display.progressMessage);
+            chatLog.getToolById(display.id)?.setActive(display.progressMessage);
+          }
+        }
+
+        // Handle completion
+        if (lastItem.answer && !lastRenderedAnswer) {
+          chatLog.finalizeAnswer(lastItem.answer);
+          lastRenderedAnswer = true;
+        }
+        if (lastItem.status === 'complete' && lastRenderedStatus !== 'complete') {
+          chatLog.addPerformanceStats(lastItem.duration ?? 0, lastItem.tokenUsage, lastItem.tokensPerSecond);
+        }
+        if (lastItem.status === 'interrupted' && lastRenderedStatus !== 'interrupted') {
+          // Stop all active tool spinners on interrupt
+          for (const display of lastItem.events) {
+            if (display.event.type === 'tool_start' && !finalizedToolIds.has(display.id)) {
+              const component = chatLog.getToolById(display.id);
+              component?.dispose?.();
+              finalizedToolIds.add(display.id);
+            }
+          }
+          chatLog.addInterrupted();
+        }
+        lastRenderedStatus = lastItem.status;
+      }
+
       workingIndicator.setState(agentRunner.workingState);
-      renderSelectionOverlay();
-      tui.requestRender();
+      updateView();
+      if (agentRunner.pendingApproval !== lastPendingApproval) {
+        lastPendingApproval = agentRunner.pendingApproval;
+        renderSelectionOverlay();
+      }
+      if (agentRunner.pendingQuestion !== lastPendingQuestion) {
+        lastPendingQuestion = agentRunner.pendingQuestion;
+        renderSelectionOverlay();
+      }
+      throttledRender();
     },
   );
 
   const intro = new IntroComponent(modelSelection.model);
   const errorText = new Text('', 0, 0);
   const workingIndicator = new WorkingIndicatorComponent(tui);
+  workingIndicator.setTurnStatsProvider(() => agentRunner.turnStats);
   const editor = new CustomEditor(tui, editorTheme);
+  const hintBar = new HintBarComponent();
   const debugPanel = new DebugPanelComponent(8, true);
+  const spacer = new Spacer(1);
 
+  // Build the component tree ONCE — stable structure, no root.clear()
+  root.addChild(intro);
+  root.addChild(chatLog);
+  root.addChild(errorText);
+  root.addChild(workingIndicator);
+  root.addChild(spacer);
+  root.addChild(editor);
+  root.addChild(hintBar);
+  root.addChild(debugPanel);
   tui.addChild(root);
+  initSpinner(tui);
+
+  // Render throttle for agent events (~30fps max)
+  let renderPending = false;
+  const RENDER_THROTTLE_MS = 32;
+  function throttledRender(): void {
+    if (renderPending) return;
+    renderPending = true;
+    setTimeout(() => {
+      renderPending = false;
+      tui.requestRender();
+    }, RENDER_THROTTLE_MS);
+  }
 
   const refreshError = () => {
     const message = lastError ?? agentRunner.error;
     errorText.setText(message ? theme.error(`Error: ${message}`) : '');
   };
+
+  // Slash command autocomplete state
+  let slashSuggestions: SlashCommand[] = [];
+  let slashSelectedIndex = 0;
+  let slashActive = false;
+
+  const HELP_TEXT = `Keyboard Shortcuts
+  esc          Interrupt query / clear input
+  ctrl+c       Exit Dexter
+  /model       Switch LLM provider and model
+  /search      Choose preferred web search provider
+  /rules       Show research rules
+  /clear       Clear conversation
+  ↑ / ↓        Navigate input history`;
+
+  const handleSlashCommand = async (command: string) => {
+    switch (command) {
+      case 'model':
+        modelSelection.startSelection();
+        break;
+      case 'search':
+        searchSelection.startSelection();
+        break;
+      case 'rules': {
+        try {
+          const rulesContent = await readFile(dexterPath('RULES.md'), 'utf-8');
+          chatLog.addChild(new Spacer(1));
+          chatLog.addChild(new Text(theme.muted('Research Rules:'), 0, 0));
+          chatLog.addChild(new Text(rulesContent, 0, 0));
+        } catch {
+          chatLog.addChild(new Spacer(1));
+          chatLog.addChild(new Text(theme.muted('No research rules set. Use "add a rule <text>" to create one.'), 0, 0));
+        }
+        tui.requestRender();
+        break;
+      }
+      case 'clear':
+        chatLog.clearAll();
+        tui.requestRender();
+        break;
+      case 'memory':
+        await agentRunner.runQuery('Show me what you know about me from memory. Use memory_search and memory_get.');
+        break;
+      case 'heartbeat':
+        await agentRunner.runQuery('Show me my current heartbeat checklist from .dexter/HEARTBEAT.md');
+        break;
+      case 'history': {
+        const messages = modelSelection.inMemoryChatHistory.getMessages();
+        chatLog.addChild(new Spacer(1));
+        if (messages.length === 0) {
+          chatLog.addChild(new Text(theme.muted('No conversation history yet.'), 0, 0));
+        } else {
+          chatLog.addChild(new Text(theme.muted('Recent conversations:'), 0, 0));
+          for (const msg of messages) {
+            const summary = msg.summary ?? msg.answer?.slice(0, 100) ?? '(pending)';
+            chatLog.addChild(new Text(theme.muted(`  ${msg.id + 1}. ${msg.query}`), 0, 0));
+            chatLog.addChild(new Text(theme.muted(`     ${summary}`), 0, 0));
+          }
+        }
+        tui.requestRender();
+        break;
+      }
+      case 'help':
+        chatLog.addChild(new Spacer(1));
+        chatLog.addChild(new Text(theme.muted(HELP_TEXT), 0, 0));
+        tui.requestRender();
+        break;
+    }
+  };
+
+  // Slash callbacks are wired after renderSelectionOverlay is defined (below)
 
   const handleSubmit = async (query: string) => {
     if (query.toLowerCase() === 'exit' || query.toLowerCase() === 'quit') {
@@ -213,17 +428,43 @@ export async function runCli() {
       return;
     }
 
-    if (query === '/model') {
-      modelSelection.startSelection();
+    // Handle all slash commands
+    if (query.startsWith('/')) {
+      const command = query.slice(1).trim().toLowerCase();
+      slashActive = false;
+      slashSuggestions = [];
+      await handleSlashCommand(command);
       return;
     }
 
-    if (modelSelection.isInSelectionFlow() || agentRunner.pendingApproval || agentRunner.isProcessing) {
+    if (
+      modelSelection.isInSelectionFlow() ||
+      searchSelection.isInSelectionFlow() ||
+      agentRunner.pendingApproval
+    ) {
+      return;
+    }
+
+    // If agent is busy, enqueue the message for mid-run injection
+    if (agentRunner.isProcessing) {
+      defaultQueue.enqueue({
+        text: query,
+        priority: 'next',
+        enqueuedAt: Date.now(),
+        source: 'cli',
+      });
+      await inputHistory.saveMessage(query);
+      chatLog.addQueuedMessage(query);
+      tui.requestRender();
       return;
     }
 
     await inputHistory.saveMessage(query);
     inputHistory.resetNavigation();
+    lastRenderedEventCount = 0;
+    lastRenderedStatus = '';
+    lastRenderedAnswer = false;
+    finalizedToolIds.clear();
     const result = await agentRunner.runQuery(query);
     if (result?.answer) {
       await inputHistory.updateAgentResponse(result.answer);
@@ -233,27 +474,27 @@ export async function runCli() {
   };
 
   editor.onSubmit = (text) => {
-    const value = text.trim();
-    if (!value) return;
+    const displayValue = text.trim();
+    if (!displayValue) return;
+    const fullValue = editor.getFullText(displayValue);
     editor.setText('');
-    editor.addToHistory(value);
-    void handleSubmit(value);
+    editor.addToHistoryWithTruncation(fullValue);
+    void handleSubmit(fullValue);
   };
 
-  editor.onEscape = () => {
-    if (modelSelection.isInSelectionFlow()) {
-      modelSelection.cancelSelection();
-      return;
-    }
-    if (agentRunner.isProcessing || agentRunner.pendingApproval) {
-      agentRunner.cancelExecution();
-      return;
-    }
-  };
+  let escPendingClear = false;
+  let escPendingExit = false;
+  let escTimeout: ReturnType<typeof setTimeout> | null = null;
+
+  // onEscape is wired after renderSelectionOverlay is defined (below)
 
   editor.onCtrlC = () => {
     if (modelSelection.isInSelectionFlow()) {
       modelSelection.cancelSelection();
+      return;
+    }
+    if (searchSelection.isInSelectionFlow()) {
+      searchSelection.cancelSelection();
       return;
     }
     if (agentRunner.isProcessing || agentRunner.pendingApproval) {
@@ -264,23 +505,40 @@ export async function runCli() {
     process.exit(0);
   };
 
-  const renderMainView = () => {
-    root.clear();
-    root.addChild(intro);
-    root.addChild(chatLog);
-    if (lastError ?? agentRunner.error) {
-      root.addChild(errorText);
+  /**
+   * Update component state without rebuilding the tree.
+   * The root is built once at init — this only changes text/hints/visibility.
+   */
+  const updateView = () => {
+    refreshError();
+    if (slashActive && slashSuggestions.length > 0) {
+      hintBar.setSuggestions(slashSuggestions, slashSelectedIndex);
+    } else {
+      hintBar.clearSuggestions();
+      hintBar.update({
+        isProcessing: agentRunner.isProcessing,
+        hasPendingApproval: !!agentRunner.pendingApproval,
+        hasInput: editor.getText().trim().length > 0,
+        escPendingClear,
+        escPendingExit,
+        queueLength: defaultQueue.length(),
+      });
     }
-    if (agentRunner.workingState.status !== 'idle') {
-      root.addChild(workingIndicator);
+    if (
+      !modelSelection.isInSelectionFlow() &&
+      !searchSelection.isInSelectionFlow() &&
+      !agentRunner.pendingApproval &&
+      !agentRunner.pendingQuestion
+    ) {
+      tui.setFocus(editor);
     }
-    root.addChild(new Spacer(1));
-    root.addChild(editor);
-    root.addChild(debugPanel);
-    tui.setFocus(editor);
   };
 
-  const renderScreenView = (
+  /**
+   * Show a full-screen selection view by replacing the root content.
+   * Used for infrequent user-initiated overlays (model selection, approval).
+   */
+  const showScreenView = (
     title: string,
     description: string,
     body: any,
@@ -294,11 +552,49 @@ export async function runCli() {
     }
   };
 
+  /**
+   * Restore the main view after an overlay screen closes.
+   */
+  const restoreMainView = () => {
+    root.clear();
+    root.addChild(intro);
+    root.addChild(chatLog);
+    root.addChild(errorText);
+    root.addChild(workingIndicator);
+    root.addChild(spacer);
+    root.addChild(editor);
+    root.addChild(hintBar);
+    root.addChild(debugPanel);
+    updateView();
+  };
+
+  // Render the question widget INLINE: keep the conversation (intro + chatLog)
+  // visible and slot the widget where the input normally sits, instead of
+  // replacing the whole screen via showScreenView.
+  const showQuestionInline = () => {
+    if (!activeQuestionPrompt) return;
+    root.clear();
+    root.addChild(intro);
+    root.addChild(chatLog);
+    root.addChild(errorText);
+    root.addChild(spacer);
+    root.addChild(activeQuestionPrompt);
+    root.addChild(debugPanel);
+    tui.setFocus(activeQuestionPrompt);
+  };
+
   const renderSelectionOverlay = () => {
     const state = modelSelection.state;
-    if (state.appState === 'idle' && !agentRunner.pendingApproval) {
-      refreshError();
-      renderMainView();
+    const searchState = searchSelection.state;
+    if (
+      state.appState === 'idle' &&
+      searchState.appState === 'idle' &&
+      !agentRunner.pendingApproval &&
+      !agentRunner.pendingQuestion
+    ) {
+      activeQuestionPrompt = null;
+      restoreMainView();
+      tui.requestRender();
       return;
     }
 
@@ -310,7 +606,28 @@ export async function runCli() {
       prompt.onSelect = (decision: ApprovalDecision) => {
         agentRunner.respondToApproval(decision);
       };
-      renderScreenView('', '', prompt, undefined, prompt.selector);
+      showScreenView('', '', prompt, undefined, prompt.selector);
+      return;
+    }
+
+    if (agentRunner.pendingQuestion) {
+      if (!activeQuestionPrompt) {
+        activeQuestionPrompt = new QuestionPromptComponent(
+          agentRunner.pendingQuestion.questions,
+          tui,
+        );
+        activeQuestionPrompt.onSubmit = (answers) => {
+          chatLog.addAnsweredQuestions(answers.answers);
+          agentRunner.respondToQuestion(answers);
+        };
+        activeQuestionPrompt.onCancel = () => {
+          agentRunner.respondToQuestion({ answers: [], declined: true });
+        };
+        activeQuestionPrompt.onAbort = () => {
+          agentRunner.cancelExecution();
+        };
+      }
+      showQuestionInline();
       return;
     }
 
@@ -318,7 +635,7 @@ export async function runCli() {
       const selector = createProviderSelector(modelSelection.provider, (providerId) => {
         void modelSelection.handleProviderSelect(providerId);
       });
-      renderScreenView(
+      showScreenView(
         'Select provider',
         'Switch between LLM providers. Applies to this session and future sessions.',
         selector,
@@ -335,7 +652,7 @@ export async function runCli() {
         (modelId) => modelSelection.handleModelSelect(modelId),
         state.pendingProvider,
       );
-      renderScreenView(
+      showScreenView(
         `Select model for ${getProviderDisplayName(state.pendingProvider)}`,
         '',
         selector,
@@ -349,7 +666,7 @@ export async function runCli() {
       const input = new ApiKeyInputComponent();
       input.onSubmit = (value) => modelSelection.handleModelInputSubmit(value);
       input.onCancel = () => modelSelection.handleModelInputSubmit(null);
-      renderScreenView(
+      showScreenView(
         `Enter model name for ${getProviderDisplayName(state.pendingProvider)}`,
         'Type or paste the model name from openrouter.ai/models',
         input,
@@ -363,7 +680,7 @@ export async function runCli() {
       const selector = createApiKeyConfirmSelector((wantsToSet) =>
         modelSelection.handleApiKeyConfirm(wantsToSet),
       );
-      renderScreenView(
+      showScreenView(
         'Set API Key',
         `Would you like to set your ${getProviderDisplayName(state.pendingProvider)} API key?`,
         selector,
@@ -378,9 +695,54 @@ export async function runCli() {
       input.onSubmit = (apiKey) => modelSelection.handleApiKeySubmit(apiKey);
       input.onCancel = () => modelSelection.handleApiKeySubmit(null);
       const apiKeyName = getApiKeyNameForProvider(state.pendingProvider) ?? '';
-      renderScreenView(
+      showScreenView(
         `Enter ${getProviderDisplayName(state.pendingProvider)} API Key`,
         apiKeyName ? `(${apiKeyName})` : '',
+        input,
+        'Enter to confirm · Esc to cancel',
+        input,
+      );
+      return;
+    }
+
+    if (searchState.appState === 'provider_select') {
+      const selector = createSearchProviderSelector(
+        searchState.preferredProvider,
+        (providerId) => searchSelection.handleProviderSelect(providerId),
+        () => searchSelection.cancelSelection(),
+      );
+      showScreenView(
+        'Select web search provider',
+        'Dexter tries your preferred provider first and falls back to the others.',
+        selector,
+        'Enter to confirm · esc to exit',
+        selector,
+      );
+      return;
+    }
+
+    if (searchState.appState === 'api_key_confirm' && searchState.pendingProvider) {
+      const selector = createApiKeyConfirmSelector((wantsToSet) =>
+        searchSelection.handleApiKeyConfirm(wantsToSet),
+      );
+      showScreenView(
+        'Set API Key',
+        `Would you like to set your ${getSearchProviderDisplayName(searchState.pendingProvider)} API key?`,
+        selector,
+        'Enter to confirm · esc to decline',
+        selector,
+      );
+      return;
+    }
+
+    if (searchState.appState === 'api_key_input' && searchState.pendingProvider) {
+      const input = new ApiKeyInputComponent(true);
+      input.onSubmit = (apiKey) => searchSelection.handleApiKeySubmit(apiKey);
+      input.onCancel = () => searchSelection.handleApiKeySubmit(null);
+      const apiKeyName = getApiKeyNameForSearchProvider(searchState.pendingProvider);
+      showScreenView(
+        `Enter ${getSearchProviderDisplayName(searchState.pendingProvider)} API Key`,
+        `(${apiKeyName})`,
         input,
         'Enter to confirm · Esc to cancel',
         input,
@@ -388,9 +750,99 @@ export async function runCli() {
     }
   };
 
+  // Wire callbacks that need renderSelectionOverlay (defined above)
+  editor.onEscape = () => {
+    if (modelSelection.isInSelectionFlow()) {
+      modelSelection.cancelSelection();
+      return;
+    }
+    if (searchSelection.isInSelectionFlow()) {
+      searchSelection.cancelSelection();
+      return;
+    }
+    if (agentRunner.isProcessing || agentRunner.pendingApproval) {
+      agentRunner.cancelExecution();
+      return;
+    }
+
+    const hasText = editor.getText().trim().length > 0;
+    if (hasText) {
+      // Double-Esc to clear input
+      if (escPendingClear) {
+        editor.setText('');
+        escPendingClear = false;
+        escPendingExit = false;
+        if (escTimeout) { clearTimeout(escTimeout); escTimeout = null; }
+      } else {
+        escPendingClear = true;
+        escPendingExit = false;
+        if (escTimeout) clearTimeout(escTimeout);
+        escTimeout = setTimeout(() => {
+          escPendingClear = false;
+          updateView();
+          tui.requestRender();
+        }, 2000);
+      }
+    } else {
+      // Double-Esc to exit
+      if (escPendingExit) {
+        tui.stop();
+        process.exit(0);
+      } else {
+        escPendingExit = true;
+        escPendingClear = false;
+        if (escTimeout) clearTimeout(escTimeout);
+        escTimeout = setTimeout(() => {
+          escPendingExit = false;
+          updateView();
+          tui.requestRender();
+        }, 2000);
+      }
+    }
+    updateView();
+    tui.requestRender();
+  };
+
+  editor.onSlashChange = (text: string) => {
+    slashSuggestions = matchCommands(text);
+    slashSelectedIndex = 0;
+    slashActive = slashSuggestions.length > 0;
+    updateView();
+    tui.requestRender();
+  };
+
+  editor.onSlashNavigate = (direction: 'up' | 'down') => {
+    if (direction === 'down') {
+      slashSelectedIndex = Math.min(slashSelectedIndex + 1, slashSuggestions.length - 1);
+    } else {
+      slashSelectedIndex = Math.max(slashSelectedIndex - 1, 0);
+    }
+    updateView();
+    tui.requestRender();
+  };
+
+  editor.onSlashSelect = () => {
+    const selected = slashSuggestions[slashSelectedIndex];
+    if (selected) {
+      slashActive = false;
+      slashSuggestions = [];
+      editor.setText('');
+      void handleSlashCommand(selected.name);
+    }
+    updateView();
+    tui.requestRender();
+  };
+
+  editor.onSlashDismiss = () => {
+    slashActive = false;
+    slashSuggestions = [];
+    updateView();
+    tui.requestRender();
+  };
+
   await inputHistory.init();
   for (const msg of inputHistory.getMessages().reverse()) {
-    editor.addToHistory(msg);
+    editor.addToHistoryWithTruncation(msg);
   }
   renderSelectionOverlay();
   refreshError();
