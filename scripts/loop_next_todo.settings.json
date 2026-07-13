@@ -1,0 +1,106 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/scripts/loop_stop_guard.sh",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "defaultMode": "auto",
+    "allow": [
+      "Edit",
+      "Write",
+      "MultiEdit",
+      "NotebookEdit",
+      "Read",
+      "Grep",
+      "Glob",
+      "TodoWrite",
+      "Skill",
+      "Task",
+      "WebFetch",
+      "WebSearch",
+      "mcp__github",
+
+      "Bash(git *)",
+      "Bash(git push --force-with-lease*)",
+      "Bash(git push --force-with-lease=*)",
+      "Bash(gh *)",
+      "Bash(make *)",
+      "Bash(bun *)",
+      "Bash(bunx *)",
+      "Bash(node *)",
+      "Bash(npx *)",
+      "Bash(tsx *)",
+      "Bash(tsc *)",
+      "Bash(python3 *)",
+      "Bash(jq *)",
+
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(grep *)",
+      "Bash(rg *)",
+      "Bash(find *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(wc *)",
+      "Bash(sed *)",
+      "Bash(awk *)",
+      "Bash(sort *)",
+      "Bash(uniq *)",
+      "Bash(diff *)",
+      "Bash(echo *)",
+      "Bash(printf *)",
+      "Bash(which *)",
+      "Bash(test *)",
+      "Bash(cd *)",
+      "Bash(pwd)",
+      "Bash(true)",
+      "Bash(date *)",
+      "Bash(env)",
+      "Bash(mkdir *)",
+      "Bash(cp *)",
+      "Bash(mv *)",
+      "Bash(touch *)",
+      "Bash(chmod *)",
+      "Bash(tee *)",
+      "Bash(xargs *)",
+      "Bash(basename *)",
+      "Bash(dirname *)",
+      "Bash(stat *)",
+      "Bash(pgrep *)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(**/.env)",
+      "Read(**/.env.*)",
+      "Read(./secrets/**)",
+      "Read(./.dexter/credentials/**)",
+      "Bash(sudo *)",
+      "Bash(curl *)",
+      "Bash(wget *)",
+      "Bash(rm -rf *)",
+      "Bash(rm -fr *)",
+      "Bash(git push --force)",
+      "Bash(git push --force *)",
+      "Bash(git push -f*)",
+      "Bash(git reset --hard*)",
+      "Bash(npm publish*)",
+      "Bash(npm login*)",
+      "Bash(bun publish*)",
+      "Bash(bun pm publish*)",
+      "Bash(bunx npm publish*)",
+      "Bash(gh repo delete*)",
+      "Bash(gh release delete*)",
+      "Bash(gh secret *)"
+    ]
+  }
+}

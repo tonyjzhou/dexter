@@ -61,3 +61,6 @@ coverage.json
 
 # Scratchpad files
 scratchpads/*
+
+# loop_next_todo.sh per-run stats (scripts/loop_stats.py)
+.loop-runs/

@@ -65,3 +65,12 @@ MVC-style separation: `AgentRunnerController` manages agent lifecycle and approv
 - **Adding a provider**: Add one entry to `PROVIDERS` in `src/providers.ts` and one factory to `MODEL_FACTORIES` in `src/model/llm.ts`.
 - **Adding a tool**: Create tool in `src/tools/`, add rich description in `src/tools/descriptions/`, register in `src/tools/registry.ts`.
 - **Adding a skill**: Create `<name>/SKILL.md` in any skill directory with YAML frontmatter.
+
+## Backlog drain loop
+
+`TODOS.md` is the backlog queue (grammar contract in-file; parsed by `scripts/next_todo.py`).
+`/todoify` writes tickets; `/next-todo` drains one; `scripts/loop_next_todo.sh` drains all READY
+items unattended (fresh headless pass per item, commits direct to main; clean tree required).
+`LOOP_DRY_RUN=1 scripts/loop_next_todo.sh` previews. Loop-harness tests: `make loop-test`
+(pytest, tests/scripts/) — run it whenever you touch `scripts/*.py`, `scripts/loop_*.sh`, or
+`tests/scripts/`.
