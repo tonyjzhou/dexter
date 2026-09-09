@@ -24,7 +24,7 @@ not speculation.
 
 This repo is a **fork of virattt/dexter** that periodically merges upstream `virattt:main`.
 Keep diffs to upstream-owned files (AGENTS.md, `src/**`, jest/package config) as small as the
-ticket allows to limit merge friction; fork-local files (CLAUDE.md, TODOS.md, `scripts/loop_*`,
+ticket allows to limit merge friction; fork-local files (AGENTS.md, TODOS.md, `scripts/loop_*`,
 `scripts/next_todo.py`, `tests/scripts/`, `.claude/`, Makefile) are free. Runtime is **Bun only**
 (never npm/yarn/pnpm); TypeScript ESM strict; tests colocated as `*.test.ts` using `bun:test`.
 

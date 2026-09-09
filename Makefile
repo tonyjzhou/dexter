@@ -1,4 +1,4 @@
-# Dexter — loop harness gate (see CLAUDE.md "Backlog drain loop")
+# Dexter — loop harness gate (see AGENTS.md "Backlog drain loop")
 
 .PHONY: loop-test
 loop-test:
